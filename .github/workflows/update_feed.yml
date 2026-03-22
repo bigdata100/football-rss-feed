@@ -1,1 +1,29 @@
 
+name: Update Football RSS Feed
+
+on:
+  schedule:
+    - cron: "0 6 * * *"   # Runs every day at 6:00 AM UTC
+  workflow_dispatch:        # Also lets you trigger it manually with a button
+
+jobs:
+  update-feed:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run enrichment script
+        env:
+          GIST_ID: ${{ secrets.GIST_ID }}
+          GITHUB_TOKEN: ${{ secrets.GIST_TOKEN }}
+        run: python enrich_rss.py

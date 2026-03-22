@@ -15,19 +15,16 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
 }
 
-# Multiple free proxy services — tried in order until one works
 PROXY_TEMPLATES = [
     "https://api.allorigins.win/raw?url={url}",
     "https://corsproxy.io/?{url}",
     "https://api.codetabs.com/v1/proxy?quest={url}",
     "https://thingproxy.freeboard.io/fetch/{url}",
-    "https://htmlpreview.github.io/?{url}",
 ]
 
 def fetch_page(target_url):
     encoded = quote(target_url, safe="")
 
-    # First try direct (sometimes GitHub IPs aren't blocked for HTML)
     print(f"🌐 Trying direct fetch...")
     try:
         r = requests.get(target_url, headers=HEADERS, timeout=15)
@@ -38,7 +35,6 @@ def fetch_page(target_url):
     except Exception as e:
         print(f"⚠️  Direct fetch failed: {e}")
 
-    # Try each proxy in order
     for template in PROXY_TEMPLATES:
         proxy_url = template.format(url=encoded)
         print(f"🔄 Trying proxy: {proxy_url[:60]}...")
@@ -47,11 +43,11 @@ def fetch_page(target_url):
             if r.status_code == 200 and len(r.text) > 500:
                 print("✅ Proxy fetch succeeded!")
                 return r.text
-            print(f"⚠️  Got {r.status_code} from this proxy, trying next...")
+            print(f"⚠️  Got {r.status_code}, trying next...")
         except Exception as e:
             print(f"⚠️  Proxy failed: {e}, trying next...")
 
-    raise Exception("❌ All proxies failed. The site may be temporarily down.")
+    raise Exception("❌ All proxies failed.")
 
 def parse_torrents(html):
     soup = BeautifulSoup(html, "html.parser")
@@ -62,17 +58,25 @@ def parse_torrents(html):
         if not href.endswith(".torrent"):
             continue
 
-        # Get title from surrounding bold tag
+        # The page structure is: <b>Match Title</b> <a href="...">TORRENT</a>
+        # So we look at the previous sibling elements to find the bold title
         title = ""
-        parent = link.find_parent()
-        if parent:
-            bold = parent.find("b") or parent.find("strong")
-            if bold:
-                title = bold.get_text(strip=True)
-        if not title:
-            title = link.get_text(strip=True)
-        if not title:
-            title = href.split("/")[-1].replace(".mkv.torrent", "").replace("%20", " ")
+
+        # Walk backwards through previous siblings to find a <b> or <strong> tag
+        for sibling in link.previous_siblings:
+            if sibling.name in ("b", "strong"):
+                title = sibling.get_text(strip=True)
+                break
+            # Also check if sibling is a tag containing bold
+            if hasattr(sibling, "find"):
+                bold = sibling.find(["b", "strong"])
+                if bold:
+                    title = bold.get_text(strip=True)
+                    break
+
+        # Fallback: extract from filename
+        if not title or title.upper() == "TORRENT":
+            title = href.split("/")[-1].replace(".mkv.torrent", "").replace("%20", " ").replace("+", " ")
 
         # Build absolute torrent URL
         if href.startswith("http"):
@@ -90,6 +94,7 @@ def parse_torrents(html):
         else:
             pub_date_str = datetime.now(timezone.utc).strftime("%a, %d %b %Y 00:00:00 +0000")
 
+        print(f"  📌 {title}")
         items.append({"title": title, "torrent_url": torrent_url, "pub_date": pub_date_str})
 
     print(f"✅ Found {len(items)} torrents")

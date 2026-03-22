@@ -4,7 +4,6 @@ from urllib.parse import quote
 from datetime import datetime, timezone
 import json
 import os
-import time
 import re
 
 BASE_URL = "https://www.sport-video.org.ua"
@@ -12,19 +11,47 @@ FOOTBALL_PAGE = f"{BASE_URL}/football.html"
 GIST_ID = os.environ["GIST_ID"]
 GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
 
-# Use a public CORS/scraping proxy to bypass IP blocks on GitHub Actions
-PROXY_URL = "https://api.allorigins.win/raw?url="
-
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
 }
 
-def fetch_page(url):
-    proxied = PROXY_URL + quote(url, safe="")
-    print(f"🌐 Fetching via proxy: {url}")
-    response = requests.get(proxied, headers=HEADERS, timeout=30)
-    response.raise_for_status()
-    return response.text
+# Multiple free proxy services — tried in order until one works
+PROXY_TEMPLATES = [
+    "https://api.allorigins.win/raw?url={url}",
+    "https://corsproxy.io/?{url}",
+    "https://api.codetabs.com/v1/proxy?quest={url}",
+    "https://thingproxy.freeboard.io/fetch/{url}",
+    "https://htmlpreview.github.io/?{url}",
+]
+
+def fetch_page(target_url):
+    encoded = quote(target_url, safe="")
+
+    # First try direct (sometimes GitHub IPs aren't blocked for HTML)
+    print(f"🌐 Trying direct fetch...")
+    try:
+        r = requests.get(target_url, headers=HEADERS, timeout=15)
+        if r.status_code == 200:
+            print("✅ Direct fetch succeeded!")
+            return r.text
+        print(f"⚠️  Direct fetch returned {r.status_code}")
+    except Exception as e:
+        print(f"⚠️  Direct fetch failed: {e}")
+
+    # Try each proxy in order
+    for template in PROXY_TEMPLATES:
+        proxy_url = template.format(url=encoded)
+        print(f"🔄 Trying proxy: {proxy_url[:60]}...")
+        try:
+            r = requests.get(proxy_url, headers=HEADERS, timeout=20)
+            if r.status_code == 200 and len(r.text) > 500:
+                print("✅ Proxy fetch succeeded!")
+                return r.text
+            print(f"⚠️  Got {r.status_code} from this proxy, trying next...")
+        except Exception as e:
+            print(f"⚠️  Proxy failed: {e}, trying next...")
+
+    raise Exception("❌ All proxies failed. The site may be temporarily down.")
 
 def parse_torrents(html):
     soup = BeautifulSoup(html, "html.parser")
@@ -32,69 +59,63 @@ def parse_torrents(html):
 
     for link in soup.find_all("a", href=True):
         href = link["href"]
-        if href.endswith(".torrent"):
-            # Get the title from the bold text before the link, or from link text
-            title = ""
-            parent = link.find_parent()
-            if parent:
-                bold = parent.find("b") or parent.find("strong")
-                if bold:
-                    title = bold.get_text(strip=True)
-            if not title:
-                title = link.get_text(strip=True)
-            if not title:
-                # Extract title from the filename
-                filename = href.split("/")[-1].replace(".mkv.torrent", "").replace("%20", " ")
-                title = filename
+        if not href.endswith(".torrent"):
+            continue
 
-            # Build absolute torrent URL
-            if href.startswith("http"):
-                torrent_url = href
-            else:
-                torrent_url = BASE_URL + "/" + href.lstrip("/")
+        # Get title from surrounding bold tag
+        title = ""
+        parent = link.find_parent()
+        if parent:
+            bold = parent.find("b") or parent.find("strong")
+            if bold:
+                title = bold.get_text(strip=True)
+        if not title:
+            title = link.get_text(strip=True)
+        if not title:
+            title = href.split("/")[-1].replace(".mkv.torrent", "").replace("%20", " ")
 
-            # URL-encode spaces and special characters
-            torrent_url = torrent_url.replace(" ", "%20").replace("&", "%26")
+        # Build absolute torrent URL
+        if href.startswith("http"):
+            torrent_url = href
+        else:
+            torrent_url = BASE_URL + "/" + href.lstrip("/")
 
-            # Try to extract date from title (format: DD.MM.YYYY)
-            date_match = re.search(r"(\d{2})\.(\d{2})\.(\d{4})", title)
-            if date_match:
-                day, month, year = date_match.groups()
-                pub_date = datetime(int(year), int(month), int(day), tzinfo=timezone.utc)
-                pub_date_str = pub_date.strftime("%a, %d %b %Y 00:00:00 +0000")
-            else:
-                pub_date_str = datetime.now(timezone.utc).strftime("%a, %d %b %Y 00:00:00 +0000")
+        torrent_url = torrent_url.replace(" ", "%20").replace("&", "%26")
 
-            items.append({
-                "title": title,
-                "torrent_url": torrent_url,
-                "pub_date": pub_date_str,
-            })
+        # Extract date from title
+        date_match = re.search(r"(\d{2})\.(\d{2})\.(\d{4})", title)
+        if date_match:
+            day, month, year = date_match.groups()
+            pub_date_str = datetime(int(year), int(month), int(day), tzinfo=timezone.utc).strftime("%a, %d %b %Y 00:00:00 +0000")
+        else:
+            pub_date_str = datetime.now(timezone.utc).strftime("%a, %d %b %Y 00:00:00 +0000")
+
+        items.append({"title": title, "torrent_url": torrent_url, "pub_date": pub_date_str})
 
     print(f"✅ Found {len(items)} torrents")
     return items
 
 def build_rss(items):
-    lines = []
-    lines.append('<?xml version="1.0" encoding="UTF-8"?>')
-    lines.append('<rss version="2.0">')
-    lines.append('  <channel>')
-    lines.append('    <title>Football Torrents - sport-video.org.ua</title>')
-    lines.append('    <link>https://www.sport-video.org.ua/football.html</link>')
-    lines.append('    <description>Football match torrents scraped from sport-video.org.ua</description>')
-    lines.append(f'    <lastBuildDate>{datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S +0000")}</lastBuildDate>')
-
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<rss version="2.0">',
+        '  <channel>',
+        '    <title>Football Torrents - sport-video.org.ua</title>',
+        '    <link>https://www.sport-video.org.ua/football.html</link>',
+        '    <description>Football match torrents scraped from sport-video.org.ua</description>',
+        f'    <lastBuildDate>{datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S +0000")}</lastBuildDate>',
+    ]
     for item in items:
-        lines.append('    <item>')
-        lines.append(f'      <title>{item["title"]}</title>')
-        lines.append(f'      <link>{item["torrent_url"]}</link>')
-        lines.append(f'      <guid>{item["torrent_url"]}</guid>')
-        lines.append(f'      <pubDate>{item["pub_date"]}</pubDate>')
-        lines.append(f'      <enclosure url="{item["torrent_url"]}" type="application/x-bittorrent"/>')
-        lines.append('    </item>')
-
-    lines.append('  </channel>')
-    lines.append('</rss>')
+        lines += [
+            '    <item>',
+            f'      <title>{item["title"]}</title>',
+            f'      <link>{item["torrent_url"]}</link>',
+            f'      <guid>{item["torrent_url"]}</guid>',
+            f'      <pubDate>{item["pub_date"]}</pubDate>',
+            f'      <enclosure url="{item["torrent_url"]}" type="application/x-bittorrent"/>',
+            '    </item>',
+        ]
+    lines += ['  </channel>', '</rss>']
     return "\n".join(lines)
 
 def push_to_gist(content):
@@ -103,18 +124,11 @@ def push_to_gist(content):
         "Authorization": f"token {GITHUB_TOKEN}",
         "Accept": "application/vnd.github.v3+json"
     }
-    payload = {
-        "files": {
-            "football_torrents.rss": {
-                "content": content
-            }
-        }
-    }
-    response = requests.patch(url, headers=headers, data=json.dumps(payload), timeout=15)
-    response.raise_for_status()
-    print("✅ Gist updated successfully!")
-    raw_url = response.json()["files"]["football_torrents.rss"]["raw_url"]
-    print(f"📡 Raw RSS URL: {raw_url}")
+    payload = {"files": {"football_torrents.rss": {"content": content}}}
+    r = requests.patch(url, headers=headers, data=json.dumps(payload), timeout=15)
+    r.raise_for_status()
+    raw_url = r.json()["files"]["football_torrents.rss"]["raw_url"]
+    print(f"✅ Gist updated! RSS URL: {raw_url}")
 
 if __name__ == "__main__":
     print("📥 Fetching football page...")

@@ -1,10 +1,9 @@
-
 name: Update Football RSS Feed
 
 on:
   schedule:
     - cron: "0 6 * * *"   # Runs every day at 6:00 AM UTC
-  workflow_dispatch:        # Also lets you trigger it manually with a button
+  workflow_dispatch:        # Lets you trigger it manually too
 
 jobs:
   update-feed:
@@ -20,7 +19,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install requests
+        run: pip install requests beautifulsoup4
 
       - name: Run enrichment script
         env:

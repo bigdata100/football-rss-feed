@@ -1,87 +1,96 @@
 import requests
-import xml.etree.ElementTree as ET
+from bs4 import BeautifulSoup
 from urllib.parse import quote
+from datetime import datetime, timezone
 import json
 import os
 import time
-import random
+import re
 
-RSS_URL = "https://www.sport-video.org.ua/rss.xml"
-BASE_TORRENT_URL = "https://www.sport-video.org.ua/"
+BASE_URL = "https://www.sport-video.org.ua"
+FOOTBALL_PAGE = f"{BASE_URL}/football.html"
 GIST_ID = os.environ["GIST_ID"]
 GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
 
+# Use a public CORS/scraping proxy to bypass IP blocks on GitHub Actions
+PROXY_URL = "https://api.allorigins.win/raw?url="
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Referer": "https://www.sport-video.org.ua/",
 }
 
-def fetch_rss(retries=5):
-    for attempt in range(retries):
-        try:
-            delay = random.uniform(3, 8)
-            print(f"⏳ Waiting {delay:.1f}s before request (attempt {attempt + 1}/{retries})...")
-            time.sleep(delay)
+def fetch_page(url):
+    proxied = PROXY_URL + quote(url, safe="")
+    print(f"🌐 Fetching via proxy: {url}")
+    response = requests.get(proxied, headers=HEADERS, timeout=30)
+    response.raise_for_status()
+    return response.text
 
-            session = requests.Session()
-            # Visit homepage first to get cookies, like a real browser would
-            session.get("https://www.sport-video.org.ua/", headers=HEADERS, timeout=15)
-            time.sleep(random.uniform(1, 3))
+def parse_torrents(html):
+    soup = BeautifulSoup(html, "html.parser")
+    items = []
 
-            response = session.get(RSS_URL, headers=HEADERS, timeout=15)
-            response.raise_for_status()
-            print("✅ RSS fetched successfully!")
-            return response.text
+    for link in soup.find_all("a", href=True):
+        href = link["href"]
+        if href.endswith(".torrent"):
+            # Get the title from the bold text before the link, or from link text
+            title = ""
+            parent = link.find_parent()
+            if parent:
+                bold = parent.find("b") or parent.find("strong")
+                if bold:
+                    title = bold.get_text(strip=True)
+            if not title:
+                title = link.get_text(strip=True)
+            if not title:
+                # Extract title from the filename
+                filename = href.split("/")[-1].replace(".mkv.torrent", "").replace("%20", " ")
+                title = filename
 
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 429 and attempt < retries - 1:
-                wait = (attempt + 1) * 15  # 15s, 30s, 45s, 60s...
-                print(f"⚠️  Rate limited (429). Waiting {wait}s before retry...")
-                time.sleep(wait)
+            # Build absolute torrent URL
+            if href.startswith("http"):
+                torrent_url = href
             else:
-                raise
-    raise Exception("❌ Failed to fetch RSS after all retries.")
+                torrent_url = BASE_URL + "/" + href.lstrip("/")
 
-def build_torrent_url(title):
-    filename = title.strip() + ".mkv.torrent"
-    return BASE_TORRENT_URL + quote(filename)
+            # URL-encode spaces and special characters
+            torrent_url = torrent_url.replace(" ", "%20").replace("&", "%26")
 
-def enrich_rss(raw_xml):
-    root = ET.fromstring(raw_xml)
-    channel = root.find("channel")
+            # Try to extract date from title (format: DD.MM.YYYY)
+            date_match = re.search(r"(\d{2})\.(\d{2})\.(\d{4})", title)
+            if date_match:
+                day, month, year = date_match.groups()
+                pub_date = datetime(int(year), int(month), int(day), tzinfo=timezone.utc)
+                pub_date_str = pub_date.strftime("%a, %d %b %Y 00:00:00 +0000")
+            else:
+                pub_date_str = datetime.now(timezone.utc).strftime("%a, %d %b %Y 00:00:00 +0000")
 
+            items.append({
+                "title": title,
+                "torrent_url": torrent_url,
+                "pub_date": pub_date_str,
+            })
+
+    print(f"✅ Found {len(items)} torrents")
+    return items
+
+def build_rss(items):
     lines = []
     lines.append('<?xml version="1.0" encoding="UTF-8"?>')
     lines.append('<rss version="2.0">')
     lines.append('  <channel>')
     lines.append('    <title>Football Torrents - sport-video.org.ua</title>')
     lines.append('    <link>https://www.sport-video.org.ua/football.html</link>')
-    lines.append('    <description>Football match torrents auto-enriched from sport-video.org.ua</description>')
+    lines.append('    <description>Football match torrents scraped from sport-video.org.ua</description>')
+    lines.append(f'    <lastBuildDate>{datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S +0000")}</lastBuildDate>')
 
-    for item in channel.findall("item"):
-        title_el    = item.find("title")
-        pub_date_el = item.find("pubDate")
-        desc_el     = item.find("description")
-
-        title    = title_el.text.strip()    if title_el    is not None and title_el.text    else ""
-        pub_date = pub_date_el.text.strip() if pub_date_el is not None and pub_date_el.text else ""
-        desc     = desc_el.text.strip()     if desc_el     is not None and desc_el.text     else ""
-
-        torrent_url = build_torrent_url(title)
-
+    for item in items:
         lines.append('    <item>')
-        lines.append(f'      <title>{title}</title>')
-        lines.append(f'      <link>{torrent_url}</link>')
-        lines.append(f'      <guid>{torrent_url}</guid>')
-        if pub_date:
-            lines.append(f'      <pubDate>{pub_date}</pubDate>')
-        if desc:
-            lines.append(f'      <description>{desc}</description>')
-        lines.append(f'      <enclosure url="{torrent_url}" type="application/x-bittorrent"/>')
+        lines.append(f'      <title>{item["title"]}</title>')
+        lines.append(f'      <link>{item["torrent_url"]}</link>')
+        lines.append(f'      <guid>{item["torrent_url"]}</guid>')
+        lines.append(f'      <pubDate>{item["pub_date"]}</pubDate>')
+        lines.append(f'      <enclosure url="{item["torrent_url"]}" type="application/x-bittorrent"/>')
         lines.append('    </item>')
 
     lines.append('  </channel>')
@@ -108,9 +117,17 @@ def push_to_gist(content):
     print(f"📡 Raw RSS URL: {raw_url}")
 
 if __name__ == "__main__":
-    print("📥 Fetching RSS feed...")
-    raw_xml = fetch_rss()
-    print("🔧 Enriching with torrent links...")
-    enriched = enrich_rss(raw_xml)
+    print("📥 Fetching football page...")
+    html = fetch_page(FOOTBALL_PAGE)
+
+    print("🔍 Parsing torrent links...")
+    items = parse_torrents(html)
+
+    if not items:
+        raise Exception("❌ No torrents found — page structure may have changed.")
+
+    print("🔧 Building RSS feed...")
+    rss = build_rss(items)
+
     print("☁️  Pushing to Gist...")
-    push_to_gist(enriched)
+    push_to_gist(rss)

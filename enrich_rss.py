@@ -19,7 +19,10 @@ DETAIL_RE = re.compile(r"/([A-Z][A-Za-z]{0,11}\d{6})\.html$")
 TORRENT_URL_RE = re.compile(r"https?://www\.sport-video\.org\.ua/[^\s\"'<>\)\]]+?\.torrent", re.I)
 DETAIL_URL_RE = re.compile(r"https?://www\.sport-video\.org\.ua/[A-Z][A-Za-z]{0,11}\d{6}\.html")
 
-MAX_DETAIL_PAGES = 25  # safety cap on extra fetches per run
+MAX_DETAIL_PAGES = 25   # safety cap on extra fetches per run
+MAX_FEED_ITEMS = 100    # cap on total items kept in the feed
+FETCH_ROUNDS = 2        # full proxy-chain attempts per URL
+ROUND_PAUSE = 8         # seconds between rounds (lets jina rate limit cool off)
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
@@ -48,26 +51,30 @@ def fetch_page(target_url):
     encoded = quote(target_url, safe="")
 
     print(f"🌐 Fetching {target_url}")
-    try:
-        r = requests.get(target_url, headers=HEADERS, timeout=15)
-        if r.status_code == 200 and is_valid_page(r.text):
-            print("✅ Direct fetch succeeded!")
-            return r.text
-        print(f"⚠️  Direct fetch returned {r.status_code} (or invalid content)")
-    except Exception as e:
-        print(f"⚠️  Direct fetch failed: {e}")
-
-    for template, needs_encoding in PROXY_TEMPLATES:
-        proxy_url = template.format(url=encoded if needs_encoding else target_url)
-        print(f"🔄 Trying proxy: {proxy_url[:60]}...")
+    for attempt in range(1, FETCH_ROUNDS + 1):
+        if attempt > 1:
+            print(f"🔁 Retry round {attempt} in {ROUND_PAUSE}s...")
+            time.sleep(ROUND_PAUSE)
         try:
-            r = requests.get(proxy_url, headers=HEADERS, timeout=20)
+            r = requests.get(target_url, headers=HEADERS, timeout=15)
             if r.status_code == 200 and is_valid_page(r.text):
-                print("✅ Proxy fetch succeeded!")
+                print("✅ Direct fetch succeeded!")
                 return r.text
-            print(f"⚠️  Got {r.status_code} or invalid content, trying next...")
+            print(f"⚠️  Direct fetch returned {r.status_code} (or invalid content)")
         except Exception as e:
-            print(f"⚠️  Proxy failed: {e}, trying next...")
+            print(f"⚠️  Direct fetch failed: {e}")
+
+        for template, needs_encoding in PROXY_TEMPLATES:
+            proxy_url = template.format(url=encoded if needs_encoding else target_url)
+            print(f"🔄 Trying proxy: {proxy_url[:60]}...")
+            try:
+                r = requests.get(proxy_url, headers=HEADERS, timeout=20)
+                if r.status_code == 200 and is_valid_page(r.text):
+                    print("✅ Proxy fetch succeeded!")
+                    return r.text
+                print(f"⚠️  Got {r.status_code} or invalid content, trying next...")
+            except Exception as e:
+                print(f"⚠️  Proxy failed: {e}, trying next...")
 
     raise Exception(f"❌ All fetch methods failed for {target_url}")
 
@@ -209,6 +216,44 @@ def build_rss(items):
     return "\n".join(lines)
 
 
+def load_previous_items():
+    """Pull the current feed from the Gist so items we fail to re-fetch this
+    run are preserved. Makes the feed self-healing across scheduled runs."""
+    try:
+        url = f"https://api.github.com/gists/{GIST_ID}"
+        headers = {
+            "Authorization": f"token {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github.v3+json"
+        }
+        r = requests.get(url, headers=headers, timeout=15)
+        r.raise_for_status()
+        content = r.json()["files"]["football_torrents.rss"]["content"]
+        items = []
+        pattern = (r"<item>\s*<title>(.*?)</title>\s*<link>(.*?)</link>"
+                   r"\s*<guid>.*?</guid>\s*<pubDate>(.*?)</pubDate>")
+        for m in re.finditer(pattern, content, re.S):
+            items.append({"title": m.group(1), "torrent_url": m.group(2), "pub_date": m.group(3)})
+        print(f"♻️  Loaded {len(items)} items from previous feed")
+        return items
+    except Exception as e:
+        print(f"⚠️  Could not load previous feed (continuing without merge): {e}")
+        return []
+
+
+def merge_items(new_items, old_items):
+    seen = {it["torrent_url"] for it in new_items}
+    merged = list(new_items)
+    carried = 0
+    for it in old_items:
+        if it["torrent_url"] not in seen:
+            seen.add(it["torrent_url"])
+            merged.append(it)
+            carried += 1
+    if carried:
+        print(f"♻️  Carried over {carried} items missing from this scrape")
+    return merged[:MAX_FEED_ITEMS]
+
+
 def push_to_gist(content):
     url = f"https://api.github.com/gists/{GIST_ID}"
     headers = {
@@ -231,6 +276,9 @@ if __name__ == "__main__":
 
     if not items:
         raise Exception("❌ No torrents found — page structure may have changed.")
+
+    print("♻️  Merging with previous feed...")
+    items = merge_items(items, load_previous_items())
 
     print("🔧 Building RSS feed...")
     rss = build_rss(items)

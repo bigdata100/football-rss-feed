@@ -15,17 +15,22 @@ GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
 # Detail pages look like /EWUW090626.html (uppercase code + DDMMYY)
 DETAIL_RE = re.compile(r"/([A-Z][A-Za-z]{0,11}\d{6})\.html$")
 
+# Raw-text fallbacks (work on markdown from r.jina.ai or any non-HTML response)
+TORRENT_URL_RE = re.compile(r"https?://www\.sport-video\.org\.ua/[^\s\"'<>\)\]]+?\.torrent", re.I)
+DETAIL_URL_RE = re.compile(r"https?://www\.sport-video\.org\.ua/[A-Z][A-Za-z]{0,11}\d{6}\.html")
+
 MAX_DETAIL_PAGES = 25  # safety cap on extra fetches per run
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
 }
 
+# (template, needs_url_encoding)
 PROXY_TEMPLATES = [
-    "https://api.allorigins.win/raw?url={url}",
-    "https://corsproxy.io/?{url}",
-    "https://api.codetabs.com/v1/proxy?quest={url}",
-    "https://thingproxy.freeboard.io/fetch/{url}",
+    ("https://corsproxy.io/?url={url}", True),          # new corsproxy API format
+    ("https://api.codetabs.com/v1/proxy?quest={url}", False),  # wants raw URL
+    ("https://api.allorigins.win/raw?url={url}", True),
+    ("https://r.jina.ai/{url}", False),                  # returns markdown; regex fallback handles it
 ]
 
 
@@ -52,8 +57,8 @@ def fetch_page(target_url):
     except Exception as e:
         print(f"⚠️  Direct fetch failed: {e}")
 
-    for template in PROXY_TEMPLATES:
-        proxy_url = template.format(url=encoded)
+    for template, needs_encoding in PROXY_TEMPLATES:
+        proxy_url = template.format(url=encoded if needs_encoding else target_url)
         print(f"🔄 Trying proxy: {proxy_url[:60]}...")
         try:
             r = requests.get(proxy_url, headers=HEADERS, timeout=20)
@@ -120,6 +125,17 @@ def parse_listing(html):
                 seen_d.add(absu)
                 details.append(absu)
 
+    if not torrents and not details:
+        # Non-HTML response (e.g. markdown via r.jina.ai) -> raw regex scan
+        for u in TORRENT_URL_RE.findall(html):
+            if u not in seen_t:
+                seen_t.add(u)
+                torrents.append(u)
+        for u in DETAIL_URL_RE.findall(html):
+            if u not in seen_d:
+                seen_d.add(u)
+                details.append(u)
+
     return torrents, details
 
 
@@ -129,7 +145,8 @@ def torrent_from_detail_page(html):
     for link in soup.find_all("a", href=True):
         if link["href"].strip().lower().endswith(".torrent"):
             return absolutize(link["href"])
-    return None
+    m = TORRENT_URL_RE.search(html)  # markdown/non-HTML fallback
+    return m.group(0) if m else None
 
 
 def collect_items(listing_html):
